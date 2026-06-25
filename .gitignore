@@ -210,13 +210,15 @@ data/human_logs/*.json
 data/logs_archive/*.json
 data/models/*.h5
 data/models/*.keras
-data/reports/*.json
-data/reports/*.csv
-data/reports/*.png
+data/report/
+data/reports/
+data/training_history/*.json
+data/training_history/*.csv
+data/training_history/*.png
 !data/human_logs/.gitkeep
 !data/logs_archive/.gitkeep
 !data/models/.gitkeep
-!data/reports/.gitkeep
+!data/training_history/.gitkeep
 
 # Ruff stuff:
 .ruff_cache/

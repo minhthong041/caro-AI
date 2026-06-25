@@ -1,6 +1,7 @@
 import os
 import json
 import csv
+import random
 import numpy as np
 import shutil
 
@@ -10,6 +11,8 @@ os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
 from keras.models import Model, load_model
 from keras.layers import Add, Activation, BatchNormalization, Conv2D, Dense, Flatten, Input, Reshape
 from keras.metrics import SparseTopKCategoricalAccuracy
+from keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+from keras.optimizers import Adam
 
 from src.config import BOARD_SIZE
 
@@ -27,7 +30,7 @@ class SupervisedAI:
         nếu chưa có hoặc load_existing=False, model được tạo khi gọi
         build_cnn_model/train_model.
         """
-        self.model_path = os.path.join(os.path.dirname(__file__), '..', model_path)
+        self.model_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', model_path))
         self.board_size = BOARD_SIZE
         self.model = None
         
@@ -78,7 +81,7 @@ class SupervisedAI:
         x = Add()([x, shortcut])
         return Activation('relu')(x)
 
-    def build_cnn_model(self, input_channels=CHANNEL_COUNT):
+    def build_cnn_model(self, input_channels=CHANNEL_COUNT, learning_rate=0.001):
         """
         Tạo Residual CNN nhận bàn cờ và xuất xác suất cho mọi ô.
 
@@ -105,18 +108,18 @@ class SupervisedAI:
 
         model = Model(inputs=inputs, outputs=outputs, name='caro_resnet_policy')
         model.compile(
-            optimizer='adam',
+            optimizer=Adam(learning_rate=learning_rate),
             loss='sparse_categorical_crossentropy',
             metrics=self.get_training_metrics(),
         )
         return model
 
-    def compile_model_for_training(self):
+    def compile_model_for_training(self, learning_rate=0.001):
         """
         Compile model khi thật sự train; predict không cần bước này.
         """
         self.model.compile(
-            optimizer='adam',
+            optimizer=Adam(learning_rate=learning_rate),
             loss='sparse_categorical_crossentropy',
             metrics=self.get_training_metrics(),
         )
@@ -319,14 +322,18 @@ class SupervisedAI:
                 
         return train_files, skipped_files, total_steps, total_samples
 
-    def split_training_files(self, files, validation_split=0.2):
+    def split_training_files(self, files, validation_split=0.2, seed=0, shuffle=True):
         """
         Tách file log thành train/validation theo cách quyết định được.
 
-        Với ít nhất hai file, một phần dữ liệu được giữ lại để đo validation
-        thay vì chỉ báo accuracy trên chính dữ liệu train.
+        Với ít nhất hai file, một phần dữ liệu được giữ lại để đo validation.
+        Khi shuffle=True, thứ tự file được trộn bằng seed cố định để validation
+        không phụ thuộc vào tên file/timestamp nhưng vẫn lặp lại được.
         """
         files = sorted(files)
+        if shuffle:
+            rng = random.Random(seed)
+            rng.shuffle(files)
         if validation_split <= 0 or len(files) < 2:
             return files, []
 
@@ -385,10 +392,10 @@ class SupervisedAI:
 
     def save_training_history(self, history, report):
         """
-        Lưu loss/accuracy/top-k sau khi train để có số liệu đưa vào báo cáo.
+        Lưu loss/accuracy/top-k sau khi train để đối chiếu kết quả huấn luyện.
         """
-        reports_path = os.path.join(os.path.dirname(__file__), '..', 'data', 'reports')
-        os.makedirs(reports_path, exist_ok=True)
+        history_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'data', 'training_history'))
+        os.makedirs(history_path, exist_ok=True)
 
         history_data = {
             metric: [float(value) for value in values]
@@ -399,11 +406,11 @@ class SupervisedAI:
             "history": history_data,
         }
 
-        json_path = os.path.join(reports_path, 'cnn_training_history.json')
+        json_path = os.path.join(history_path, 'cnn_training_history.json')
         with open(json_path, 'w', encoding='utf-8') as f:
             json.dump(payload, f, indent=2)
 
-        csv_path = os.path.join(reports_path, 'cnn_training_history.csv')
+        csv_path = os.path.join(history_path, 'cnn_training_history.csv')
         metrics = list(history_data.keys())
         epoch_count = max((len(values) for values in history_data.values()), default=0)
         with open(csv_path, 'w', encoding='utf-8', newline='') as f:
@@ -422,7 +429,7 @@ class SupervisedAI:
         try:
             import matplotlib.pyplot as plt
 
-            plot_path = os.path.join(reports_path, 'cnn_training_history.png')
+            plot_path = os.path.join(history_path, 'cnn_training_history.png')
             plt.figure(figsize=(9, 5))
             for metric, values in history_data.items():
                 plt.plot(range(1, len(values) + 1), values, marker='o', label=metric)
@@ -441,6 +448,41 @@ class SupervisedAI:
         if plot_path:
             print(f"Saved training plot to {plot_path}")
         return json_path, csv_path, plot_path
+
+    def build_training_callbacks(self, monitor, checkpoint_path=None):
+        """
+        Tạo callback giúp train ổn định hơn khi dữ liệu ít.
+
+        EarlyStopping trả model về epoch tốt nhất, ReduceLROnPlateau giảm learning
+        rate khi metric không cải thiện, còn checkpoint lưu bản tốt nhất ra file
+        riêng để không phụ thuộc duy nhất vào model cuối cùng.
+        """
+        callbacks = [
+            EarlyStopping(
+                monitor=monitor,
+                patience=4,
+                restore_best_weights=True,
+                verbose=1,
+            ),
+            ReduceLROnPlateau(
+                monitor=monitor,
+                factor=0.5,
+                patience=2,
+                min_lr=1e-5,
+                verbose=1,
+            ),
+        ]
+        if checkpoint_path:
+            os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+            callbacks.append(
+                ModelCheckpoint(
+                    filepath=checkpoint_path,
+                    monitor=monitor,
+                    save_best_only=True,
+                    verbose=1,
+                )
+            )
+        return callbacks
     
     def get_archive_destination(self, archive_path, filename):
         """
@@ -460,7 +502,7 @@ class SupervisedAI:
             
         return destination
     
-    def data_generator(self, logs_path, files=None, batch_size=32):
+    def data_generator(self, logs_path, files=None, batch_size=32, shuffle=True, seed=0):
         """
         Sinh batch dữ liệu train CNN theo kiểu đọc cuốn chiếu từ file log.
 
@@ -469,14 +511,19 @@ class SupervisedAI:
         """
         X_batch, y_batch = [], []
         selected_files = list(files) if files is not None else None
+        rng = random.Random(seed)
         
         # Keras fit() yêu cầu generator lặp cho tới khi đủ steps_per_epoch.
         while True:
             files_to_read = selected_files
             if files_to_read is None:
                 files_to_read = [f for f in os.listdir(logs_path) if f.endswith(".json")]
+            else:
+                files_to_read = list(files_to_read)
             if not files_to_read:
                 return
+            if shuffle:
+                rng.shuffle(files_to_read)
                 
             yielded_any = False
                 
@@ -496,20 +543,26 @@ class SupervisedAI:
                 steps = data.get('history', [])
                 if not isinstance(steps, list):
                     continue
+
+                steps = [step for step in steps if self.is_trainable_step(step, winner)]
+                if shuffle:
+                    rng.shuffle(steps)
                     
                 for step in steps:
-                    if self.is_trainable_step(step, winner):
-                        board_state = self.normalize_board_for_player(step['board'], step['player'])
-                        r, c = int(step['move'][0]), int(step['move'][1])
+                    board_state = self.normalize_board_for_player(step['board'], step['player'])
+                    r, c = int(step['move'][0]), int(step['move'][1])
+                    symmetries = self.get_symmetries(board_state, r, c)
+                    if shuffle:
+                        rng.shuffle(symmetries)
+                    
+                    for aug_board, aug_move in symmetries:
+                        X_batch.append(self.prepare_board_input(aug_board))
+                        y_batch.append(aug_move)
                         
-                        for aug_board, aug_move in self.get_symmetries(board_state, r, c):
-                            X_batch.append(self.prepare_board_input(aug_board))
-                            y_batch.append(aug_move)
-                            
-                            if len(X_batch) >= batch_size:
-                                yielded_any = True
-                                yield np.array(X_batch), np.array(y_batch)
-                                X_batch, y_batch = [], []
+                        if len(X_batch) >= batch_size:
+                            yielded_any = True
+                            yield np.array(X_batch), np.array(y_batch)
+                            X_batch, y_batch = [], []
                     
             if X_batch:
                 yielded_any = True
@@ -519,7 +572,19 @@ class SupervisedAI:
             if not yielded_any:
                 return
 
-    def train_model(self, logs_dir='data/human_logs', validation_split=0.2, rebuild_model=False):
+    def train_model(
+        self,
+        logs_dir='data/human_logs',
+        validation_split=0.2,
+        rebuild_model=False,
+        epochs=10,
+        batch_size=32,
+        learning_rate=0.001,
+        seed=0,
+        shuffle=True,
+        archive=True,
+        checkpoint=True,
+    ):
         """
         Huấn luyện CNN từ các file log và lưu model sau khi train xong.
 
@@ -527,7 +592,16 @@ class SupervisedAI:
         không hợp lệ, sau đó chuyển log đã xử lý sang thư mục archive để lần
         train sau không học lặp lại cùng dữ liệu.
         """
-        logs_path = os.path.join(os.path.dirname(__file__), '..', logs_dir)
+        if epochs < 1:
+            raise ValueError("epochs must be >= 1")
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        if not 0 <= validation_split < 1:
+            raise ValueError("validation_split must be in the range [0, 1)")
+        if learning_rate <= 0:
+            raise ValueError("learning_rate must be > 0")
+
+        logs_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', logs_dir))
         if not os.path.exists(logs_path): return
         
         all_files = sorted(f for f in os.listdir(logs_path) if f.endswith('.json'))
@@ -535,9 +609,8 @@ class SupervisedAI:
             print(f"No JSON log files found in {logs_path}.")
             return
         
-        batch_size = 32
         files_to_train, skipped_files, total_steps, total_samples = self.build_training_report(logs_path, all_files)
-        print(f"Found {len(all_files)} JSON log files in human_logs.")
+        print(f"Found {len(all_files)} JSON log files in {logs_dir}.")
         
         if total_samples == 0:
             print("No valid winning human/minimax samples found for CNN training.")
@@ -549,7 +622,12 @@ class SupervisedAI:
             for report in skipped_files:
                 print(f"Skipped {report['filename']}: {report['skip_reason']}")
 
-        train_files, validation_files = self.split_training_files(files_to_train, validation_split)
+        train_files, validation_files = self.split_training_files(
+            files_to_train,
+            validation_split=validation_split,
+            seed=seed,
+            shuffle=shuffle,
+        )
         train_steps, train_samples = self.count_samples_for_files(logs_path, train_files)
         validation_steps, validation_samples = self.count_samples_for_files(logs_path, validation_files)
 
@@ -563,16 +641,33 @@ class SupervisedAI:
 
         steps_per_epoch = max(1, (train_samples + batch_size - 1) // batch_size)
         if rebuild_model or self.model is None:
-            self.model = self.build_cnn_model(input_channels=self.CHANNEL_COUNT)
-        elif getattr(self.model, 'optimizer', None) is None:
-            self.compile_model_for_training()
+            self.model = self.build_cnn_model(input_channels=self.CHANNEL_COUNT, learning_rate=learning_rate)
+        else:
+            self.compile_model_for_training(learning_rate=learning_rate)
 
         validation_data = self.build_dataset(logs_path, validation_files) if validation_files else None
+        monitor = 'val_loss' if validation_data is not None else 'loss'
+        checkpoint_path = None
+        if checkpoint:
+            checkpoint_path = os.path.abspath(os.path.join(
+                os.path.dirname(__file__),
+                '..',
+                'data',
+                'models',
+                'caro_supervised_best.keras',
+            ))
         history = self.model.fit(
-            self.data_generator(logs_path, files=train_files, batch_size=batch_size),
+            self.data_generator(
+                logs_path,
+                files=train_files,
+                batch_size=batch_size,
+                shuffle=shuffle,
+                seed=seed,
+            ),
             steps_per_epoch=steps_per_epoch,
-            epochs=10,
+            epochs=epochs,
             validation_data=validation_data,
+            callbacks=self.build_training_callbacks(monitor, checkpoint_path),
         )
 
         self.save_training_history(history, {
@@ -585,6 +680,13 @@ class SupervisedAI:
             "validation_steps": validation_steps,
             "train_samples": train_samples,
             "validation_samples": validation_samples,
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "learning_rate": learning_rate,
+            "seed": seed,
+            "shuffle": shuffle,
+            "archive": archive,
+            "best_checkpoint": checkpoint_path,
             "input_shape": str(self.get_model_input_shape()),
             "rebuild_model": rebuild_model,
         })
@@ -593,16 +695,23 @@ class SupervisedAI:
         self.model.save(self.model_path)
         
         # Di chuyển đúng các file đã thật sự đóng góp sample sang archive.
-        archive_path = os.path.join(os.path.dirname(__file__), '..', 'data', 'logs_archive')
-        os.makedirs(archive_path, exist_ok=True)
-        archived = 0
-        for filename in files_to_train:
-            file_path = os.path.join(logs_path, filename)
-            if not os.path.exists(file_path):
-                continue
-            shutil.move(file_path, self.get_archive_destination(archive_path, filename))
-            archived += 1
-        print(f"Archived {archived} trained log files.")
+        archive_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'data', 'logs_archive'))
+        if os.path.abspath(logs_path) == os.path.abspath(archive_path):
+            archive = False
+            print("Archive skipped because logs_dir already points to data/logs_archive.")
+
+        if archive:
+            os.makedirs(archive_path, exist_ok=True)
+            archived = 0
+            for filename in files_to_train:
+                file_path = os.path.join(logs_path, filename)
+                if not os.path.exists(file_path):
+                    continue
+                shutil.move(file_path, self.get_archive_destination(archive_path, filename))
+                archived += 1
+            print(f"Archived {archived} trained log files.")
+        else:
+            print("Archive disabled; trained log files were left in place.")
 
     def get_best_move(self, grid, player=2):
         """
