@@ -219,7 +219,7 @@ data/training_history/*.png
 !data/logs_archive/.gitkeep
 !data/models/.gitkeep
 !data/training_history/.gitkeep
-
+outputs/
 # Ruff stuff:
 .ruff_cache/
 
